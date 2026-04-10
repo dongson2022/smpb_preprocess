@@ -1,13 +1,13 @@
-# N-STORM 单分子成像数据预处理工具
+# 单分子成像数据预处理工具
 
-本工具集用于 Nikon N-STORM 单分子荧光显微镜数据的预处理。
+本工具集适用于 Nikon N-STORM 单分子荧光显微镜采集的xyt/xyct成像数据的预处理，包括spot intensity trace的提取和检查。
 
 ## 工具列表
 
 | 工具 | 功能 | 输入 | 输出 |
 |------|------|------|------|
-| spot_extractor.py | 一站式光斑提取 | ND2 文件 | TIFF + JSON + CSV |
-| spot_profile_check.py | Spot 数据标注与导出 | Spots 目录 | CSV |
+| spot_extractor.py | Spot 数据提取 | ND2 文件 | TIFF + JSON + CSV |
+| spot_profile_check.py | Spot 数据检查 | Spots 目录 | CSV |
 
 ## 依赖安装
 
