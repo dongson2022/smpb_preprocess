@@ -1,0 +1,12 @@
+# Ignore everything
+*
+
+# But not these files
+!.gitignore
+!user guide.md
+!spot_extractor.py
+!spot_profile_check.py
+
+# And not the images directory
+!images/
+!images/**
