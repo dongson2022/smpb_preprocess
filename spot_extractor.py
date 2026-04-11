@@ -1,6 +1,6 @@
 """
 Spot Extractor Tool
-从 ND2 原始数据中提取高斯光斑及其时间序列信息
+从 ND2/TIFF 原始数据中提取高斯光斑及其时间序列信息
 整合最大投影、光斑检测、原始视频提取和强度曲线计算功能
 """
 
@@ -160,7 +160,8 @@ def save_tiff(data: np.ndarray, output_path: Path):
 
 
 def extract_spot_video_worker(spot_id: int, x: int, y: int, channel_data: np.ndarray,
-                              output_dir: str, box_size: int, camera_offset: float) -> tuple:
+                              output_dir: str, box_size: int, camera_offset: float,
+                              radii: float) -> tuple:
     """
     提取单个 spot 的原始视频和强度曲线（模块级函数，用于多进程）
 
@@ -172,6 +173,7 @@ def extract_spot_video_worker(spot_id: int, x: int, y: int, channel_data: np.nda
         output_dir: 输出目录字符串
         box_size: 方框大小
         camera_offset: camera offset 值
+        radii: spot 半径 (用于圆形强度计算)
 
     Returns:
         (spot_id, video_path, csv_path) 或 (spot_id, None, None) 如果失败
@@ -180,11 +182,17 @@ def extract_spot_video_worker(spot_id: int, x: int, y: int, channel_data: np.nda
         output_dir = Path(output_dir)
         half_box = box_size // 2
 
-        # 计算截取区域边界
+        # 视频截取区域 (方框)
         y_start = max(0, y - half_box)
         y_end = y_start + box_size
         x_start = max(0, x - half_box)
         x_end = x_start + box_size
+
+        # 预计算圆形 mask (用于强度计算)
+        half_r = int(np.ceil(radii)) + 1
+        mask_h = 2 * half_r + 1
+        yy, xx = np.ogrid[:mask_h, :mask_h]
+        circular_mask = (xx - half_r)**2 + (yy - half_r)**2 <= radii**2
 
         n_frames = channel_data.shape[0]
 
@@ -199,12 +207,21 @@ def extract_spot_video_worker(spot_id: int, x: int, y: int, channel_data: np.nda
             if frame.ndim == 3:
                 frame = np.max(frame, axis=0)
 
-            # 截取 ROI
+            # 截取视频 ROI (方框)
             roi = frame[y_start:y_end, x_start:x_end]
             roi_stack.append(roi)
 
-            # 计算强度 (每个像素减去 offset 后求平均)
-            intensity = np.mean(roi.astype(np.float64) - camera_offset)
+            # 计算强度 (圆形 mask 内像素减去 offset 后求均值)
+            cy_start = y - half_r
+            cy_end = y + half_r + 1
+            cx_start = x - half_r
+            cx_end = x + half_r + 1
+            circle_region = frame[cy_start:cy_end, cx_start:cx_end]
+
+            if circular_mask.sum() > 0 and circle_region.shape == (mask_h, mask_h):
+                intensity = np.mean(circle_region[circular_mask].astype(np.float64) - camera_offset)
+            else:
+                intensity = 0.0
             intensities.append(intensity)
 
         # 保存视频为 TIFF stack
@@ -488,9 +505,11 @@ class SpotExtractorApp:
         self.root.title("Spot Extractor - 单分子光斑提取工具")
         self.root.geometry("1500x1100")
 
-        # ND2 数据
-        self.nd2_path = None
-        self.nd2_image = None  # AICSImage 对象
+        # 图像数据
+        self.image_path = None
+        self.image_format = None  # 'nd2' 或 'tif'
+        self.nd2_image = None  # AICSImage 对象 (ND2)
+        self.tif_data = None  # numpy array (TIFF xyt)
         self.max_projections = {}  # {channel_index: max_proj_array}
         self.max_proj_files = {}  # {channel_index: filepath}
         self.n_channels = 0
@@ -504,7 +523,7 @@ class SpotExtractorApp:
         self.current_spots = []
 
         # 预处理参数
-        self.median_size = tk.IntVar(value=2)
+        self.median_size = tk.IntVar(value=1)
 
         # 对比度参数
         self.vmin = tk.DoubleVar(value=80)
@@ -518,7 +537,7 @@ class SpotExtractorApp:
 
         # 显示和提取参数
         self.box_size = tk.IntVar(value=7)
-        self.camera_offset = tk.DoubleVar(value=100)
+        self.camera_offset = tk.DoubleVar(value=0)
 
         # 显示状态
         self.show_spots_var = tk.BooleanVar(value=True)
@@ -566,10 +585,10 @@ class SpotExtractorApp:
         control_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # === 文件操作 ===
-        file_frame = ttk.LabelFrame(self.control_frame, text="ND2 文件", padding=5)
+        file_frame = ttk.LabelFrame(self.control_frame, text="图像文件", padding=5)
         file_frame.pack(fill=tk.X, pady=5, padx=2)
 
-        ttk.Button(file_frame, text="选择 ND2 文件", command=self.select_nd2_file).pack(fill=tk.X, pady=2)
+        ttk.Button(file_frame, text="选择文件", command=self.select_file).pack(fill=tk.X, pady=2)
         self.file_label = ttk.Label(file_frame, text="未加载文件")
         self.file_label.pack(pady=2, fill=tk.X)
 
@@ -685,18 +704,28 @@ class SpotExtractorApp:
         # === 状态栏 ===
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill=tk.X, side=tk.BOTTOM)
-        self.status_label = ttk.Label(status_frame, text="就绪 - 请选择 ND2 文件", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_label = ttk.Label(status_frame, text="就绪 - 请选择 ND2/TIFF 文件", relief=tk.SUNKEN, anchor=tk.W)
         self.status_label.pack(fill=tk.X, padx=5, pady=2)
 
-    def select_nd2_file(self):
-        """选择 ND2 文件"""
+    def select_file(self):
+        """选择图像文件 (ND2 或 TIFF)"""
         filepath = filedialog.askopenfilename(
-            title="选择 ND2 文件",
-            filetypes=[("ND2 文件", "*.nd2"), ("所有文件", "*.*")]
+            title="选择图像文件",
+            filetypes=[
+                ("ND2 文件", "*.nd2"),
+                ("TIFF 文件", "*.tif *.tiff"),
+                ("所有文件", "*.*")
+            ]
         )
 
         if filepath:
-            self.load_nd2_file(filepath)
+            ext = Path(filepath).suffix.lower()
+            if ext == '.nd2':
+                self.load_nd2_file(filepath)
+            elif ext in ('.tif', '.tiff'):
+                self.load_tif_file(filepath)
+            else:
+                messagebox.showwarning("警告", f"不支持的文件格式: {ext}")
 
     def load_nd2_file(self, filepath: str):
         """加载 ND2 文件"""
@@ -706,8 +735,10 @@ class SpotExtractorApp:
             self.status_label.config(text="正在加载 ND2 文件...")
             self.root.update()
 
-            self.nd2_path = Path(filepath)
+            self.image_path = Path(filepath)
+            self.image_format = 'nd2'
             self.nd2_image = AICSImage(filepath)
+            self.tif_data = None
 
             # 获取维度信息
             dims_order = self.nd2_image.dims.order
@@ -724,7 +755,7 @@ class SpotExtractorApp:
                 self.current_channel = 0
 
             # 更新文件信息
-            self.file_label.config(text=f"{self.nd2_path.name}")
+            self.file_label.config(text=f"{self.image_path.name}")
             self.frame_label.config(text=f"帧数: {self.n_frames}")
 
             # 重置状态
@@ -738,11 +769,92 @@ class SpotExtractorApp:
             # 清空右侧图像区
             self.clear_image_viewer()
 
-            self.status_label.config(text=f"已加载: {self.nd2_path.name} | {self.n_channels} 通道, {self.n_frames} 帧")
+            self.status_label.config(text=f"已加载: {self.image_path.name} | {self.n_channels} 通道, {self.n_frames} 帧")
 
         except Exception as e:
             messagebox.showerror("错误", f"无法加载 ND2 文件: {e}")
             self.status_label.config(text="加载失败")
+
+    def load_tif_file(self, filepath: str):
+        """加载多页 TIFF 文件 (xyt 格式)"""
+        try:
+            import tifffile
+
+            self.status_label.config(text="正在加载 TIFF 文件...")
+            self.root.update()
+
+            self.image_path = Path(filepath)
+            self.image_format = 'tif'
+            self.nd2_image = None
+            self.tif_data = tifffile.imread(filepath)
+
+            # 验证维度: 期望 (T, Y, X) 或 (Y, X)
+            if self.tif_data.ndim == 2:
+                self.tif_data = self.tif_data[np.newaxis, ...]
+            elif self.tif_data.ndim != 3:
+                messagebox.showerror("错误",
+                    f"不支持的 TIFF 维度: {self.tif_data.ndim}D\n"
+                    f"仅支持 xyt 格式 (3D: T×Y×X)")
+                self.status_label.config(text="加载失败")
+                return
+
+            self.n_frames = self.tif_data.shape[0]
+            self.n_channels = 1  # xyt TIFF 仅支持单通道
+            self.channel_names = ["通道 1"]
+
+            # 设置 camera offset 为全局最小值
+            self._update_camera_offset_default(self.tif_data)
+
+            # 更新通道下拉菜单
+            self.channel_combo['values'] = self.channel_names
+            self.channel_combo.current(0)
+            self.current_channel = 0
+
+            # 更新文件信息
+            self.file_label.config(text=f"{self.image_path.name}")
+            self.frame_label.config(text=f"帧数: {self.n_frames}")
+
+            # 重置状态
+            self.max_projections.clear()
+            self.max_proj_files.clear()
+            self.current_max_proj = None
+            self.processed_image = None
+            self.current_spots = []
+            self.proj_status.config(text="状态: 未生成")
+
+            # 清空右侧图像区
+            self.clear_image_viewer()
+
+            self.status_label.config(
+                text=f"已加载: {self.image_path.name} | "
+                     f"{self.n_frames} 帧, {self.tif_data.shape[1]}×{self.tif_data.shape[2]}")
+
+        except Exception as e:
+            messagebox.showerror("错误", f"无法加载 TIFF 文件: {e}")
+            self.status_label.config(text="加载失败")
+
+    def get_channel_data(self, channel_index: int) -> np.ndarray:
+        """获取指定通道的数据 (TZYX 或 TYX)"""
+        if self.image_format == 'nd2':
+            return self.nd2_image.get_image_data("TZYX", C=channel_index)
+        elif self.image_format == 'tif':
+            return self.tif_data  # (T, Y, X)
+        else:
+            raise ValueError(f"未知图像格式: {self.image_format}")
+
+    def _update_camera_offset_default(self, data: np.ndarray):
+        """根据数据最小值更新 camera offset 默认值"""
+        data_min = float(np.min(data))
+        self.camera_offset.set(round(data_min, 1))
+
+    def _auto_set_contrast(self, image: np.ndarray):
+        """根据图像百分位数自动设定对比度"""
+        vmin_auto = float(np.percentile(image, 1))
+        vmax_auto = float(np.percentile(image, 99))
+        if vmax_auto <= vmin_auto:
+            vmax_auto = vmin_auto + 1
+        self.vmin.set(round(vmin_auto, 1))
+        self.vmax.set(round(vmax_auto, 1))
 
     def clear_image_viewer(self):
         """清空右侧图像查看器"""
@@ -784,8 +896,8 @@ class SpotExtractorApp:
 
     def generate_max_projection(self):
         """生成当前通道的最大投影"""
-        if self.nd2_image is None:
-            messagebox.showwarning("警告", "请先加载 ND2 文件")
+        if self.image_path is None:
+            messagebox.showwarning("警告", "请先加载图像文件")
             return
 
         try:
@@ -795,8 +907,8 @@ class SpotExtractorApp:
 
             ch = self.current_channel
 
-            # 获取该通道的所有时间帧数据 (TZYX)
-            channel_data = self.nd2_image.get_image_data("TZYX", C=ch)
+            # 获取该通道的所有时间帧数据
+            channel_data = self.get_channel_data(ch)
 
             # 沿时间轴进行最大投影
             max_proj = np.max(channel_data, axis=0)
@@ -808,9 +920,15 @@ class SpotExtractorApp:
             self.max_projections[ch] = max_proj
             self.current_max_proj = max_proj
 
+            # 根据图像自动设定对比度
+            self._auto_set_contrast(max_proj)
+
+            # 更新 camera offset 为当前通道数据最小值
+            self._update_camera_offset_default(channel_data)
+
             # 保存最大投影文件
-            output_name = f"{self.nd2_path.stem}_ch{ch + 1}_max.tif"
-            output_path = self.nd2_path.parent / output_name
+            output_name = f"{self.image_path.stem}_ch{ch + 1}_max.tif"
+            output_path = self.image_path.parent / output_name
             save_tiff(max_proj, output_path)
             self.max_proj_files[ch] = output_path
 
@@ -916,14 +1034,14 @@ class SpotExtractorApp:
             messagebox.showwarning("警告", "当前没有检测数据，请先执行检测")
             return
 
-        if self.nd2_path is None:
+        if self.image_path is None:
             return
 
-        output_path = self.nd2_path.parent / f"{self.nd2_path.stem}_ch{self.current_channel + 1}_spots.json"
+        output_path = self.image_path.parent / f"{self.image_path.stem}_ch{self.current_channel + 1}_spots.json"
 
         try:
             data = {
-                'source_file': self.nd2_path.name,
+                'source_file': self.image_path.name,
                 'channel': self.current_channel + 1,
                 'image_shape': list(self.current_max_proj.shape) if self.current_max_proj is not None else None,
                 'parameters': {
@@ -963,7 +1081,7 @@ class SpotExtractorApp:
             messagebox.showerror("错误", f"保存失败: {e}")
 
     def extract_spot_video(self, spot: dict, channel_data: np.ndarray, output_dir: Path,
-                           box_size: int, camera_offset: float) -> tuple:
+                           box_size: int, camera_offset: float, radii: float) -> tuple:
         """
         提取单个 spot 的原始视频和强度曲线
 
@@ -973,6 +1091,7 @@ class SpotExtractorApp:
             output_dir: 输出目录
             box_size: 方框大小
             camera_offset: camera offset 值
+            radii: spot 半径 (用于圆形强度计算)
 
         Returns:
             (video_path, csv_path) 或 (None, None) 如果失败
@@ -984,11 +1103,17 @@ class SpotExtractorApp:
 
             half_box = box_size // 2
 
-            # 计算截取区域边界
+            # 视频截取区域 (方框)
             y_start = max(0, y - half_box)
             y_end = y_start + box_size
             x_start = max(0, x - half_box)
             x_end = x_start + box_size
+
+            # 预计算圆形 mask (用于强度计算)
+            half_r = int(np.ceil(radii)) + 1
+            mask_h = 2 * half_r + 1
+            yy, xx = np.ogrid[:mask_h, :mask_h]
+            circular_mask = (xx - half_r)**2 + (yy - half_r)**2 <= radii**2
 
             n_frames = channel_data.shape[0]
 
@@ -1003,12 +1128,21 @@ class SpotExtractorApp:
                 if frame.ndim == 3:
                     frame = np.max(frame, axis=0)
 
-                # 截取 ROI
+                # 截取视频 ROI (方框)
                 roi = frame[y_start:y_end, x_start:x_end]
                 roi_stack.append(roi)
 
-                # 计算强度 (每个像素减去 offset 后求平均)
-                intensity = np.mean(roi.astype(np.float64) - camera_offset)
+                # 计算强度 (圆形 mask 内像素减去 offset 后求均值)
+                cy_start = y - half_r
+                cy_end = y + half_r + 1
+                cx_start = x - half_r
+                cx_end = x + half_r + 1
+                circle_region = frame[cy_start:cy_end, cx_start:cx_end]
+
+                if circular_mask.sum() > 0 and circle_region.shape == (mask_h, mask_h):
+                    intensity = np.mean(circle_region[circular_mask].astype(np.float64) - camera_offset)
+                else:
+                    intensity = 0.0
                 intensities.append(intensity)
 
             # 保存视频为 TIFF stack
@@ -1036,7 +1170,7 @@ class SpotExtractorApp:
             messagebox.showwarning("警告", "当前没有检测数据，请先执行检测")
             return
 
-        if self.nd2_path is None:
+        if self.image_path is None:
             return
 
         try:
@@ -1044,11 +1178,11 @@ class SpotExtractorApp:
             self.status_label.config(text="正在准备数据...")
             self.root.update()
 
-            # 预先获取通道数据
-            channel_data = self.nd2_image.get_image_data("TZYX", C=self.current_channel)
+            # 获取通道数据
+            channel_data = self.get_channel_data(self.current_channel)
 
             # 创建输出目录（包含通道信息）
-            output_dir = self.nd2_path.parent / f"{self.nd2_path.stem}_ch{self.current_channel + 1}_spots"
+            output_dir = self.image_path.parent / f"{self.image_path.stem}_ch{self.current_channel + 1}_spots"
             output_dir.mkdir(exist_ok=True)
 
             n_spots = len(self.current_spots)
@@ -1070,7 +1204,8 @@ class SpotExtractorApp:
                     channel_data,
                     str(output_dir),
                     box_size,
-                    camera_offset
+                    camera_offset,
+                    spot['radii']
                 )
 
                 _, video_path, csv_path = result
@@ -1096,8 +1231,8 @@ class SpotExtractorApp:
 
     def process_all(self):
         """一键处理：生成最大投影、检测 spots、提取视频"""
-        if self.nd2_image is None:
-            messagebox.showwarning("警告", "请先加载 ND2 文件")
+        if self.image_path is None:
+            messagebox.showwarning("警告", "请先加载图像文件")
             return
 
         try:
